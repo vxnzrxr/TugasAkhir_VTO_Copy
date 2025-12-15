@@ -1,1 +1,10 @@
+node_modules/
 .venv/
+__pycache__/
+my_model/
+results/
+
+# Tambahan (Jaga-jaga)
+*.safetensors
+*.pth
+*.ckpt

@@ -24,6 +24,15 @@ except ImportError:
     HAS_VOICE = False
     print("⚠️ Library SpeechRecognition belum diinstall.")
 
+try:
+    from transformers import BertTokenizer, BertForSequenceClassification
+    import torch
+    import torch.nn.functional as F
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+    print("⚠️ Warning: Library transformers belum terinstall.")
+
 # --- KONFIGURASI SKALA ---
 IS_DEV = True 
 ORIGINAL_WIDTH = 1080
@@ -179,15 +188,34 @@ class CalibrationGestureScreen(tk.Frame):
         self.create_nav_buttons() 
 
     def on_show(self):
-        self.success_triggered = False  # <--- RESET STATUS DISINI
+        self.success_triggered = False
+        
+        # 1. Reset status label agar user tahu sedang loading
+        self.status_label.config(text="Initializing Camera...", fg="#b8b8b8")
+        
+        # 2. PENTING: Beri jeda 100ms (0.1 detik) sebelum menyalakan kamera.
+        # Ini memberi waktu bagi Tkinter untuk menghapus layar Home dan menggambar background hitam.
+        self.after(100, self.start_camera_process)
+
+    def start_camera_process(self):
+        # Cek keamanan: Jika user sudah pindah layar saat loading, batalkan.
+        if not self.winfo_viewable(): 
+            return
 
         if HAS_CV:
             self.detector = HandGestureDetector()
-            self.vto = VirtualTryOnApp()
+            # self.vto = VirtualTryOnApp() # (Ingat baris ini dikomen/matikan agar tombol alumni hilang)
             self.is_running = True
-            self.cap = cv2.VideoCapture(0)
-            if not self.cap.isOpened():
-                print("⚠️ Kamera tidak terbuka!")
+            
+            # --- Proses Berat Dimulai Disini (Tapi layar sudah aman/bersih) ---
+            self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+            
+            # Fallback ke kamera 0 jika 1 gagal
+            if self.cap is None or not self.cap.isOpened():
+                print("⚠️ Kamera index 1 gagal! Mencoba index 0...")
+                self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+
+            # Update status dan mulai loop kamera
             self.status_label.config(text="Angkat tangan ke depan kamera", fg="#b8b8b8")
             self.update_camera()
         else:
@@ -222,9 +250,9 @@ class CalibrationGestureScreen(tk.Frame):
                 else:
                     self.status_label.config(text="Webcam Aktif (Arahkan Tangan)", fg="#b8b8b8")
                 
-                # Update VTO logic (background)
-                if self.vto:
-                    self.vto.apply_gesture(gesture, frame, finger_pos)
+                # Update VTO logic (background) INI GA PERLU SUMPAH
+                # if self.vto:
+                #    self.vto.apply_gesture(gesture, frame, finger_pos)
             
             # 3. --- PROSES GAMBAR UNTUK UI (CROP & SCALE) ---
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -671,7 +699,14 @@ class VTOGestureScreen(tk.Frame):
         if HAS_CV:
             self.detector = HandGestureDetector()
             self.is_running = True
-            self.cap = cv2.VideoCapture(0)
+            
+            # --- PERBAIKAN DISINI JUGA (Ganti 0 ke 1) ---
+            self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+            
+            # Fallback (Jaga-jaga jika index 1 tidak ada)
+            if not self.cap.isOpened():
+                 self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                 
             self.update_camera()
             
     def on_hide(self):
@@ -933,170 +968,245 @@ class VTOVoiceScreen(tk.Frame):
     def __init__(self, parent, controller):
         super().__init__(parent, bg="#0a0a0a")
         self.controller = controller
+        
+        # --- 1. SETUP VARIABEL ---
         self.is_listening = False
         self.clothes = ["Classic Blazer", "Denim Jacket", "Casual Shirt"]
         self.selected_index = 0
         
+        # Variabel Kamera
+        self.cap = None
+        self.is_camera_running = False
+        self.cam_image_id = None 
+        self.photo = None # Simpan referensi agar tidak di-garbage collect
+        
+        # Variabel AI
+        self.last_command = "Menunggu..."
+        self.tokenizer = None
+        self.model = None
+        self.model_ready = False
+        self.label_map = {0: "KIRI", 1: "KANAN", 2: "KELUAR", 3: "NETRAL"}
+
         # Load Icons
         self.icon_shirt = self.load_icon("shirt_icon.png", s(60))
         self.icon_exit = self.load_icon("exit_icon.png", s(60))
 
+        # Canvas Utama
         self.cw, self.ch = s(1080), s(1920)
         self.canvas = tk.Canvas(self, width=self.cw, height=self.ch, bg="#0a0a0a", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
-        
-        # Variabel Status untuk Feedback UI
-        self.last_command = "Menunggu..."
-        
+
+        # Init UI
         self.draw_ui()
 
+        # Load IndoBERT di Thread Background
+        if HAS_TRANSFORMERS:
+            threading.Thread(target=self.load_local_model, daemon=True).start()
+
+    def load_local_model(self):
+        """Memuat model IndoBERT hasil training sendiri"""
+        model_path = "./my_model"
+        if not os.path.exists(model_path):
+            self.last_command = "Model tidak ditemukan!"
+            self.after(0, self.update_status_text)
+            return
+
+        try:
+            print(f"⏳ Memuat model dari {model_path}...")
+            self.tokenizer = BertTokenizer.from_pretrained(model_path)
+            self.model = BertForSequenceClassification.from_pretrained(model_path)
+            self.model.eval()
+            self.model_ready = True
+            print("✅ IndoBERT Siap!")
+            self.after(0, self.update_status_text)
+        except Exception as e:
+            print(f"❌ Gagal load model: {e}")
+
     def on_show(self):
+        """Dipanggil saat layar ditampilkan"""
+        print("📸 Membuka Kamera untuk Voice Mode...")
+        
+        # 1. Mulai Kamera
+        if HAS_CV:
+            self.is_camera_running = True
+            # Prioritas: Coba 0 dulu (Laptop), kalau gagal baru 1 (USB)
+            # Ubah urutan ini jika kamu pakai kamera eksternal sebagai utama
+            self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) 
+            if not self.cap.isOpened():
+                print("⚠️ Kamera 0 gagal, mencoba kamera 1...")
+                self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+            
+            if self.cap.isOpened():
+                print("✅ Kamera Berhasil Dibuka!")
+                self.update_camera()
+            else:
+                print("❌ ERROR: Tidak ada kamera yang terdeteksi!")
+
+        # 2. Mulai Voice Listener
         self.is_listening = True
         self.last_command = "Mendengarkan..."
-        self.draw_ui()
+        self.update_status_text()
+        
         if HAS_VOICE:
             threading.Thread(target=self.listen_loop, daemon=True).start()
     
     def on_hide(self):
+        """Dipanggil saat pindah ke layar lain"""
         self.is_listening = False
+        self.is_camera_running = False
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+            print("📸 Kamera Voice Mode Ditutup.")
+
+    def update_camera(self):
+        """Looping untuk update gambar kamera ke Canvas"""
+        if not self.is_camera_running or self.cap is None:
+            return
+
+        ret, frame = self.cap.read()
+        if ret:
+            # 1. Flip & Convert Color
+            frame = cv2.flip(frame, 1)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb)
+            
+            # 2. Resize & Crop (Agar Full Screen)
+            img_w, img_h = img.size
+            target_w, target_h = self.cw, self.ch
+            scale = max(target_w / img_w, target_h / img_h)
+            new_w, new_h = int(img_w * scale), int(img_h * scale)
+            
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            
+            # Crop Center
+            left = (new_w - target_w) // 2
+            top = (new_h - target_h) // 2
+            img = img.crop((left, top, left + target_w, top + target_h))
+            
+            # 3. Update ke Canvas
+            self.photo = ImageTk.PhotoImage(img)
+            
+            if self.cam_image_id is None:
+                # Buat image item baru dengan tag "cam"
+                self.cam_image_id = self.canvas.create_image(0, 0, image=self.photo, anchor="nw", tags="cam")
+            else:
+                # Update image item yang sudah ada
+                self.canvas.itemconfig(self.cam_image_id, image=self.photo)
+            
+            # --- Z-ORDER MANAGEMENT (PENTING!) ---
+            # Pastikan kamera ("cam") selalu di paling bawah
+            self.canvas.tag_lower("cam")
+            # Pastikan UI ("ui_element") selalu di paling atas
+            self.canvas.tag_raise("ui_element")
+
+        # Ulangi setiap 33ms (~30 FPS)
+        self.after(33, self.update_camera)
 
     def draw_ui(self):
-        self.canvas.delete("all")
+        """Menggambar UI (Tombol & Teks)"""
+        self.canvas.delete("ui_element") # Hapus UI lama, JANGAN hapus kamera
         
         # --- A. TOMBOL SIDEBAR ---
-        btn_size = s(120)
-        margin_right = s(40)
-        margin_top = s(80)
-        gap = s(40)
+        btn_size, mr, mt, gap = s(120), s(40), s(80), s(40)
+        bx1, by1 = self.cw - mr - btn_size, mt
         
-        # Ikon Baju
-        bx1, by1 = self.cw - margin_right - btn_size, margin_top
-        self.draw_rounded_rect(self.canvas, bx1, by1, bx1+btn_size, by1+btn_size, s(30), fill="#2d2d44", outline="#4a4a6a")
-        if self.icon_shirt: self.canvas.create_image(bx1+btn_size//2, by1+btn_size//2, image=self.icon_shirt)
+        # Tombol Baju
+        self.draw_rounded_rect(self.canvas, bx1, by1, bx1+btn_size, by1+btn_size, s(30), fill="#2d2d44", outline="#4a4a6a", tags="ui_element")
+        if self.icon_shirt: 
+            self.canvas.create_image(bx1+btn_size//2, by1+btn_size//2, image=self.icon_shirt, tags="ui_element")
 
-        # Ikon Keluar
+        # Tombol Exit
         ex1, ey1 = bx1, by1 + btn_size + gap
-        self.draw_rounded_rect(self.canvas, ex1, ey1, ex1+btn_size, ey1+btn_size, s(30), fill="#442d2d", outline="#6a4a4a")
-        if self.icon_exit: self.canvas.create_image(ex1+btn_size//2, ey1+btn_size//2, image=self.icon_exit)
+        self.draw_rounded_rect(self.canvas, ex1, ey1, ex1+btn_size, ey1+btn_size, s(30), fill="#442d2d", outline="#6a4a4a", tags="ui_element")
+        if self.icon_exit: 
+            self.canvas.create_image(ex1+btn_size//2, ey1+btn_size//2, image=self.icon_exit, tags="ui_element")
 
-        # --- B. STATUS SUARA (BAHASA INDONESIA) ---
+        # --- B. STATUS ---
         panel_h = s(550)
         panel_y = self.ch - panel_h
         
-        # Judul Instruksi
-        self.canvas.create_text(self.cw//2, panel_y + s(50), text="Katakan 'Lanjut', 'Kembali', atau 'Keluar'", font=("Arial", s(20)), fill="#b0b0b0")
+        # Instruksi
+        self.canvas.create_text(self.cw//2, panel_y + s(50), text="Perintah: Kanan, Kiri, Keluar", font=("Arial", s(20)), fill="#ffffff", tags="ui_element")
         
-        # Feedback Status (Apa yang didengar)
-        self.canvas.create_text(self.cw//2, panel_y + s(100), text=f"Status: {self.last_command}", font=("Arial", s(24), "bold"), fill="#55ff55")
+        # Status Text
+        self.status_text_id = self.canvas.create_text(self.cw//2, panel_y + s(100), text=f"Status: {self.last_command}", font=("Arial", s(24), "bold"), fill="#55ff55", tags="ui_element")
+
+        if not self.model_ready and HAS_TRANSFORMERS:
+             self.canvas.create_text(self.cw//2, panel_y + s(140), text="(Loading AI Model...)", font=("Arial", s(14)), fill="yellow", tags=("ui_element", "loading_text"))
 
         # --- C. KARTU BAJU ---
-        card_w, card_h = s(280), s(320)
-        card_gap = s(40)
-        total_w = (card_w * 3) + (card_gap * 2)
-        start_x = (self.cw - total_w) // 2
-        card_start_y = panel_y + s(180) # Turun sedikit agar tidak menabrak teks status
+        card_w, card_h, card_gap = s(280), s(320), s(40)
+        start_x = (self.cw - ((card_w*3)+(card_gap*2))) // 2
+        card_y = panel_y + s(180) 
         
         for i, name in enumerate(self.clothes):
             x = start_x + (i * (card_w + card_gap))
-            y = card_start_y
+            is_sel = (i == self.selected_index)
             
-            is_selected = (i == self.selected_index)
-            border_col = "#6a5aff" if is_selected else ""
-            border_w = s(6) if is_selected else 0
+            border_col = "#6a5aff" if is_sel else ""
+            border_w = s(6) if is_sel else 0
             
-            self.draw_rounded_rect(self.canvas, x, y, x+card_w, y+card_h, s(20), fill="#d9d9d9", outline=border_col, width=border_w)
-            self.canvas.create_text(x + card_w//2, y + card_h + s(30), text=name, font=("Arial", s(16), "bold"), fill="white")
+            self.draw_rounded_rect(self.canvas, x, card_y, x+card_w, card_y+card_h, s(20), fill="#d9d9d9", outline=border_col, width=border_w, tags="ui_element")
+            self.canvas.create_text(x + card_w//2, card_y + card_h + s(30), text=name, font=("Arial", s(16), "bold"), fill="white", tags="ui_element")
+
+    def update_status_text(self):
+        """Update teks status saja"""
+        if hasattr(self, 'status_text_id'):
+            self.canvas.itemconfig(self.status_text_id, text=f"Status: {self.last_command}")
+            if self.model_ready:
+                self.canvas.delete("loading_text")
 
     def listen_loop(self):
         r = sr.Recognizer()
         with sr.Microphone() as source:
-            r.adjust_for_ambient_noise(source)
+            r.adjust_for_ambient_noise(source, duration=1)
             while self.is_listening:
                 try:
-                    # Dengarkan audio (Batas 3 detik agar responsif)
-                    audio = r.listen(source, timeout=3, phrase_time_limit=3)
-                    
-                    # 1. Konversi Suara ke Teks (Pakai Bahasa Indonesia)
-                    text = r.recognize_google(audio, language="id-ID").lower()
-                    print(f"User berkata: {text}")
-                    
-                    # 2. Proses Intent (NLU)
-                    intent = self.process_intent_indonesia(text)
-                    
-                    # 3. Eksekusi Perintah
-                    need_update = True
-                    if intent == "NEXT":
-                        self.selected_index = (self.selected_index + 1) % len(self.clothes)
-                        self.last_command = f"Diterima: '{text}' (Lanjut)"
-                    elif intent == "PREV":
-                        self.selected_index = (self.selected_index - 1) % len(self.clothes)
-                        self.last_command = f"Diterima: '{text}' (Kembali)"
-                    elif intent == "EXIT":
-                        self.controller.show_screen("HomeScreen")
-                        break
-                    else:
-                        self.last_command = f"Tidak paham: '{text}'"
-                        need_update = True # Tetap update UI untuk menampilkan teks error
-                    
-                    if need_update:
-                        self.after(0, self.draw_ui)
-                        
-                except sr.WaitTimeoutError:
-                    pass # Tidak ada suara, lanjut loop
-                except Exception as e:
-                    # Error koneksi atau tidak jelas
-                    pass
+                    audio = r.listen(source, timeout=5, phrase_time_limit=3)
+                    text_input = r.recognize_google(audio, language="id-ID")
+                    print(f"🗣️ User: {text_input}")
+                    intent_label = self.predict_with_model(text_input)
+                    self.execute_command(intent_label, text_input)
+                except sr.WaitTimeoutError: pass 
+                except Exception as e: print(f"Listening Error: {e}")
 
-    def process_intent_indonesia(self, text):
-        """
-        Logika NLU Sederhana pengganti IndoBERT untuk performa tinggi.
-        Mencocokkan kata kunci sinonim bahasa Indonesia.
-        """
-        # Daftar Sinonim untuk Intent
-        synonyms_next = ["lanjut", "lanjutkan", "selanjutnya", "berikutnya", "kanan", "ganti", "yang lain", "next"]
-        synonyms_prev = ["kembali", "balik", "sebelumnya", "mundur", "kiri", "back"]
-        synonyms_exit = ["keluar", "tutup", "selesai", "menu", "utama", "exit"]
-        
-        # Cek kecocokan kata
-        for word in synonyms_next:
-            if word in text: return "NEXT"
-            
-        for word in synonyms_prev:
-            if word in text: return "PREV"
-            
-        for word in synonyms_exit:
-            if word in text: return "EXIT"
-            
+    def predict_with_model(self, text):
+        if not self.model_ready: return "UNKNOWN"
+        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=32)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        probs = F.softmax(outputs.logits, dim=-1)
+        confidence, predicted_class = torch.max(probs, dim=-1)
+        idx = predicted_class.item()
+        score = confidence.item()
+        print(f"🤖 AI: Label={idx} ({self.label_map[idx]}) | Score={score:.2f}")
+        if score > 0.6: return self.label_map[idx]
         return "UNKNOWN"
 
-    # --- Integrasi IndoBERT (Opsional) ---
-    # Jika Anda WAJIB menggunakan IndoBERT (misal untuk Skripsi/Tugas Akhir), 
-    # Anda perlu menginstall library: pip install transformers torch scipy
-    # Lalu uncomment method di bawah ini dan panggil di listen_loop.
-    """
-    def predict_with_indobert(self, text):
-        try:
-            from transformers import pipeline
-            # Menggunakan Zero-Shot Classification (Memerlukan internet untuk download model pertama kali)
-            # Model XLM-RoBERTa biasanya lebih baik untuk Zero-Shot multibahasa daripada IndoBERT base raw.
-            classifier = pipeline("zero-shot-classification", model="oxford-nlp/elas-roc-large") 
-            
-            labels = ["lanjut", "kembali", "keluar"]
-            result = classifier(text, labels)
-            
-            # Ambil label dengan skor tertinggi
-            top_label = result['labels'][0]
-            score = result['scores'][0]
-            
-            if score > 0.5: # Threshold keyakinan
-                if top_label == "lanjut": return "NEXT"
-                if top_label == "kembali": return "PREV"
-                if top_label == "keluar": return "EXIT"
-            return "UNKNOWN"
-        except ImportError:
-            print("Library transformers tidak ditemukan. Gunakan keyword matching biasa.")
-            return self.process_intent_indonesia(text)
-    """
+    def execute_command(self, command, original_text):
+        update_ui = False
+        if command == "KANAN":
+            self.selected_index = (self.selected_index + 1) % len(self.clothes)
+            self.last_command = f"Geser Kanan"
+            update_ui = True
+        elif command == "KIRI":
+            self.selected_index = (self.selected_index - 1) % len(self.clothes)
+            self.last_command = f"Geser Kiri"
+            update_ui = True
+        elif command == "KELUAR":
+            self.last_command = "Keluar..."
+            self.after(0, lambda: self.controller.show_screen("HomeScreen"))
+            return
+        elif command == "NETRAL":
+            self.last_command = f"Tidak Dikenal"
+            self.after(0, self.update_status_text)
+        else:
+            self.last_command = f"?"
+            self.after(0, self.update_status_text)
+        
+        if update_ui:
+            self.after(0, self.draw_ui)
+            self.after(0, self.update_status_text)
 
     def draw_rounded_rect(self, canvas, x1, y1, x2, y2, radius, **kwargs):
         points = [x1+radius, y1, x2-radius, y1, x2, y1, x2, y1+radius, x2, y2-radius, x2, y2, x2-radius, y2, x1+radius, y2, x1, y2, x1, y2-radius, x1, y1+radius, x1, y1]
